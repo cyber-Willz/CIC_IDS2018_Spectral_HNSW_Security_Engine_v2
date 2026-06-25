@@ -32,7 +32,7 @@ If you’re interested in systems programming, memory-safe security tools, or ed
 
 
 SYSTEM LIMITATIONS & KNOWN SCIENTIFIC GAPS (v2-RUN EVALUATION)
---------------------------------------------------------------
+
 
 This document tracks the verified empirical boundaries of the 
 sec_net_engine architecture following the v2 validation pass.
