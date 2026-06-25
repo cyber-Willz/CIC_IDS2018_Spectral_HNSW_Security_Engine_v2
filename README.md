@@ -4,6 +4,8 @@ I wanted to see if I could do better at the edge.
 
 For the past few months, I’ve been building and refining an open-source Network Intrusion Detection System (NIDS) core built entirely in Rust. Today, I’m opening up the repository for the community to break, test, and build upon.
 
+docker run -p 6333:6333 -p 6334:6334 -v "$(pwd)/qdrant_storage:/qdrant/storage" qdrant/qdrant
+
 🤖 The Project: CIC-IDS2018 × Spectral + HNSW Security Engine v2
 🦀 The Stack: Rust | Burn Framework | Qdrant/HNSW | Graph Spectral Math
 
