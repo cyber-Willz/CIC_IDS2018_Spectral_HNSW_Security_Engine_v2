@@ -1,4 +1,7 @@
-//! # CIC-IDS2018 × Spectral Security Engine  v2
+//!~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+//! 
+//! 
+//! //! # CIC-IDS2018 × Spectral Security Engine  v2
 //!
 //! ## Architecture
 //!
@@ -26,7 +29,12 @@
 //! | 3 | Duplicate `GraphError` in `lib.rs` and `error.rs` | Canonical definition lives only in `error.rs` |
 //! | 4 | Reshape used wrong constant | Fixed with correct `FEATURE_DIM` |
 
+pub mod laplacian_regularizer;
 pub mod spectral_graph;
+
+use laplacian_regularizer::{
+    DynamicLaplacianRegularizer, NodeMeta, RegularizationReport, VirtualEdgeReason,
+};
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -878,9 +886,11 @@ mod qdrant_val {
 
 #[derive(Debug)]
 pub struct IngestResult {
-    pub anomaly_score: f32,
-    pub is_anomaly:    bool,
-    pub report:        Option<IncidentReport>,
+    pub anomaly_score:   f32,
+    pub is_anomaly:      bool,
+    pub report:          Option<IncidentReport>,
+    /// Regularizer status for this tick — always present after the first ingest.
+    pub reg_report:      Option<RegularizationReport>,
 }
 
 // ============================================================================
@@ -898,6 +908,11 @@ pub struct QdrantSpectralSecurityEngine {
     pub observed_edges: RwLock<Vec<(String, String)>>,
     spectral_cfg:       JacobiConfig,
     hnsw:               RwLock<HnswFlowIndex>,
+    /// Dynamic Laplacian regulariser — resolves λ₂=0 on disconnected topologies
+    /// by injecting similarity-scored virtual edges and an εI diagonal shift.
+    pub regularizer:    RwLock<DynamicLaplacianRegularizer>,
+    /// Monotonic regularizer tick counter.
+    reg_tick:           AtomicU64,
 }
 
 impl QdrantSpectralSecurityEngine {
@@ -918,6 +933,9 @@ impl QdrantSpectralSecurityEngine {
             observed_edges:     RwLock::new(Vec::new()),
             spectral_cfg:       JacobiConfig::default(),
             hnsw:               RwLock::new(HnswFlowIndex::new()),
+            // ε=0.01 prevents λ₂=0 collapse; α=0.5 scales virtual-edge weights
+            regularizer:        RwLock::new(DynamicLaplacianRegularizer::new(0, 0.01, 0.5)),
+            reg_tick:           AtomicU64::new(0),
         };
         engine.bootstrap(true).await?;
         Ok(engine)
@@ -987,6 +1005,47 @@ impl QdrantSpectralSecurityEngine {
                 .unwrap()
                 .push((src_str.clone(), dst_str.clone()));
         }
+
+        // ── Regularizer tick ─────────────────────────────────────────────────
+        // Rebuild the regulariser's physical edge list from observed_edges so
+        // it always reflects the current network topology.  Node ids are
+        // derived from the interner to stay consistent with spectral indices.
+        let reg_report: Option<RegularizationReport> = {
+            let edges_snapshot = self.observed_edges.read().unwrap().clone();
+            // Collect unique nodes
+            let mut node_set: Vec<String> = Vec::new();
+            let mut node_idx: HashMap<String, u32> = HashMap::new();
+            for (s, d) in &edges_snapshot {
+                for e in [s, d] {
+                    if !node_idx.contains_key(e.as_str()) {
+                        let idx = node_set.len() as u32;
+                        node_idx.insert(e.clone(), idx);
+                        node_set.push(e.clone());
+                    }
+                }
+            }
+            let n = node_set.len();
+            if n >= 2 {
+                let phys: Vec<(u32, u32, f32)> = edges_snapshot
+                    .iter()
+                    .filter_map(|(s, d)| {
+                        let u = *node_idx.get(s.as_str())?;
+                        let v = *node_idx.get(d.as_str())?;
+                        if u != v { Some((u, v, 1.0)) } else { None }
+                    })
+                    .collect();
+                let tick = self.reg_tick.fetch_add(1, Ordering::Relaxed);
+                let mut reg = self.regularizer.write().unwrap();
+                // Resize the regulariser if the node count has grown
+                if reg.fiedler_vec.len() != n {
+                    *reg = DynamicLaplacianRegularizer::new(n, 0.01, 0.5);
+                }
+                reg.update_physical_edges(phys);
+                Some(reg.tick(tick))
+            } else {
+                None
+            }
+        };
 
         let features = embed_cic_numeric(row);
         let tensor = Tensor::<NdArray, 1>::from_data(
@@ -1142,7 +1201,7 @@ impl QdrantSpectralSecurityEngine {
             ))
             .await?;
 
-        Ok(IngestResult { anomaly_score: score, is_anomaly, report })
+        Ok(IngestResult { anomaly_score: score, is_anomaly, report, reg_report })
     }
 
     /// BFS over Qdrant `dst` edges starting from `seed`.
@@ -1670,10 +1729,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for row in &dataset {
         let res = engine.ingest_cic(row).await?;
         let marker = if res.is_anomaly { "⚠ ANOMALY" } else { "  ok     " };
-        println!(
-            "  [{marker}]  mse={:.5}  label={:<35}  {}→{}",
-            res.anomaly_score, row.label, row.src_ip, row.dst_ip
-        );
+        // Show regularizer λ₂ status inline
+        let reg_tag = match &res.reg_report {
+            Some(r) if r.regularizer_active =>
+                format!("  [REG active λ₂_raw={:.4} → {:.4} virt={}]",
+                    r.lambda2_raw, r.lambda2_regularized, r.virtual_edges_injected),
+            Some(r) =>
+                format!("  [λ₂={:.4}]", r.lambda2_regularized),
+            None => String::new(),
+        };
+        println!("  [{marker}]  mse={:.5}  label={:<35}  {}→{}{}",
+            res.anomaly_score, row.label, row.src_ip, row.dst_ip, reg_tag);
         if let Some(ref rep) = res.report {
             n_reports += 1;
             println!("\n{rep}\n");
@@ -1731,6 +1797,94 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Err(e) => println!("  Report error: {e}"),
         }
         println!("  λ₁ final: {:.6}", final_sg.algebraic_connectivity());
+    }
+
+    // ── Phase 5: Dynamic Laplacian Regularizer standalone demo ───────────────
+    println!("\n━━━  Phase 5: Dynamic Laplacian Regularizer — disconnection drill  ━━━\n");
+    {
+        use laplacian_regularizer::{DynamicLaplacianRegularizer, NodeMeta};
+
+        // 6-node graph: 0-1-2 connected, 3-4-5 isolated (simulates network split)
+        let mut reg = DynamicLaplacianRegularizer::new(6, 0.01, 0.5);
+
+        // Register infrastructure metadata so similarity scoring has signal
+        let subnet_a: u32 = 0xC0A8_0100; // 192.168.1.0
+        let subnet_b: u32 = 0xC0A8_0200; // 192.168.2.0
+        for id in 0u32..3 {
+            reg.register_node(id, NodeMeta {
+                subnet_prefix: subnet_a,
+                prefix_len:    24,
+                gateway:       Some(100),
+                as_path:       vec![64512, 64513],
+                infra_parent:  Some(0),
+            });
+        }
+        for id in 3u32..6 {
+            reg.register_node(id, NodeMeta {
+                subnet_prefix: subnet_b,
+                prefix_len:    24,
+                gateway:       Some(101),
+                as_path:       vec![64514, 64513],
+                infra_parent:  Some(1),
+            });
+        }
+
+        // Tick 0 — only intra-cluster edges (two disconnected components)
+        reg.update_physical_edges(vec![
+            (0, 1, 1.0), (1, 2, 1.0),
+            (3, 4, 1.0), (4, 5, 1.0),
+        ]);
+        let r0 = reg.tick(0);
+        println!("  Tick 0 (split)   λ₂_raw={:.4}  λ₂_reg={:.4}  virt_injected={}  active={}",
+            r0.lambda2_raw, r0.lambda2_regularized, r0.virtual_edges_injected, r0.regularizer_active);
+
+        // Show injected virtual edges
+        if !reg.virtual_edges().is_empty() {
+            println!("  Virtual edges injected:");
+            for ve in reg.virtual_edges().iter().take(5) {
+                let reason = match &ve.reason {
+                    VirtualEdgeReason::CommonGateway { gateway_id }       =>
+                        format!("CommonGateway({})", gateway_id),
+                    VirtualEdgeReason::SharedSubnet { prefix_len }        =>
+                        format!("SharedSubnet(/{prefix_len})"),
+                    VirtualEdgeReason::AsPathOverlap { overlap_score }    =>
+                        format!("AsPathOverlap({:.2})", overlap_score),
+                    VirtualEdgeReason::InfrastructureParent { parent_node } =>
+                        format!("InfraParent({})", parent_node),
+                };
+                println!("    {}→{}  w={:.3}  reason={}", ve.src, ve.dst, ve.weight, reason);
+            }
+        }
+
+        // Tick 1 — add cross-cluster bridge (connectivity recovers)
+        reg.update_physical_edges(vec![
+            (0, 1, 1.0), (1, 2, 1.0),
+            (3, 4, 1.0), (4, 5, 1.0),
+            (2, 3, 0.5),   // ← new physical bridge
+        ]);
+        let r1 = reg.tick(1);
+        println!("\n  Tick 1 (bridge)  λ₂_raw={:.4}  λ₂_reg={:.4}  virt_injected={}  active={}",
+            r1.lambda2_raw, r1.lambda2_regularized, r1.virtual_edges_injected, r1.regularizer_active);
+
+        // Propagation gradients for node 2 (the bridge node)
+        let grads = reg.propagation_gradient(2);
+        println!("\n  Propagation gradients from node 2 (bridge):");
+        for (nbr, g) in &grads {
+            println!("    → node {nbr}  grad={g:+.5}");
+        }
+        println!("  (positive = flow away from node 2; negative = flow toward)");
+
+        // Simulate 10 more ticks of full connectivity — watch virtual edges decay
+        for tick in 2u64..12 {
+            let r = reg.tick(tick);
+            if tick == 11 {
+                println!("\n  Tick 11 (healed) λ₂_raw={:.4}  λ₂_reg={:.4}  virt_remaining={}",
+                    r.lambda2_raw, r.lambda2_regularized, reg.virtual_edges().len());
+            }
+        }
+        println!("\n  λ₂ trend (last {} ticks): {:?}",
+            reg.lambda2_trend().len(),
+            reg.lambda2_trend().iter().map(|v| format!("{v:.3}")).collect::<Vec<_>>());
     }
 
     println!("\n━━━  Complete  ━━━");
